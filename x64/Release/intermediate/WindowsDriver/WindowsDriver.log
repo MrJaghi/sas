@@ -1,0 +1,14 @@
+﻿  Building 'WindowsDriver' with toolset 'WindowsKernelModeDriver10.0' and the 'Universal' target platform.
+  hde64.cpp
+  visor.cpp
+  main.cpp
+E:\spoof\backend\spoofing\disk\disk.h(1340,22): error C2362: initialization of 'spt' is skipped by 'goto _spt_end'
+  (compiling source file 'main/main.cpp')
+      E:\spoof\backend\spoofing\disk\disk.h(1407,2):
+      see declaration of '_spt_end'
+  
+E:\spoof\backend\spoofing\disk\disk.h(1882,25): error C2362: initialization of 'spte' is skipped by 'goto _sptex_end'
+  (compiling source file 'main/main.cpp')
+      E:\spoof\backend\spoofing\disk\disk.h(1934,2):
+      see declaration of '_sptex_end'
+  
