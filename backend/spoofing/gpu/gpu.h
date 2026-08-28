@@ -317,7 +317,16 @@ struct gpu_
 		uintptr_t nvlddmkm_base = 0;
 		uint32_t uuid_valid_offset = 0;
 
-		nvlddmkm_base = ( uintptr_t ) kmdf_utils::GetModuleBase ( oxorany ( "nvlddmkm.sys" ) ); if ( !nvlddmkm_base ) return 0;
+		nvlddmkm_base = ( uintptr_t ) kmdf_utils::GetModuleBase ( oxorany ( "nvlddmkm.sys" ) ); if ( !nvlddmkm_base ) {
+			// Try AMD GPU if NVIDIA not found
+			uintptr_t amdkmdag_base = ( uintptr_t ) kmdf_utils::GetModuleBase ( oxorany ( "amdkmdag.sys" ) );
+			if ( amdkmdag_base ) {
+				DbgPrintEx(0, 0, "[GPU] Found AMD GPU driver (amdkmdag.sys), spoofing registry...\n");
+				spoof_amd_gpu_registry();
+				return 1;
+			}
+			return 0;
+		}
 
 		uint64_t address = ( uint64_t ) kmdf_utils::FindPatternImage ( ( PVOID ) nvlddmkm_base ,
 			oxorany("\xE8\xCC\xCC\xCC\xCC\x48\x8B\xD8\x48\x85\xC0\x0F\x84\xCC\xCC\xCC\xCC\x44\x8B\x80\xCC\xCC\xCC\xCC\x48\x8D\x15") ,
@@ -369,6 +378,112 @@ struct gpu_
 
 		return 1;
 
+	}
+
+	// AMD GPU registry spoofing
+	void spoof_amd_gpu_registry() {
+		// Spoof AMD GPU properties in registry
+		UNICODE_STRING amdPath;
+		RtlInitUnicodeString(&amdPath, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}");
+		HANDLE hAmd;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &amdPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+		if (NT_SUCCESS(ZwOpenKey(&hAmd, KEY_READ, &oa))) {
+			ULONG idx = 0;
+			BYTE keyBuf[512];
+			while (TRUE) {
+				ULONG resultLen;
+				NTSTATUS st = ZwEnumerateKey(hAmd, idx++, KeyBasicInformation, keyBuf, sizeof(keyBuf), &resultLen);
+				if (st == STATUS_NO_MORE_ENTRIES) break;
+				if (!NT_SUCCESS(st)) continue;
+
+				PKEY_BASIC_INFORMATION kbi = (PKEY_BASIC_INFORMATION)keyBuf;
+				wchar_t subPath[512];
+				RtlStringCchPrintfW(subPath, 512, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\%.*s",
+					kbi->NameLength / sizeof(wchar_t), kbi->Name);
+
+				UNICODE_STRING uSubPath;
+				RtlInitUnicodeString(&uSubPath, subPath);
+				HANDLE hSub;
+				InitializeObjectAttributes(&oa, &uSubPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+				if (NT_SUCCESS(ZwOpenKey(&hSub, KEY_READ, &oa))) {
+					// Check if this is an AMD GPU
+					UNICODE_STRING providerName;
+					RtlInitUnicodeString(&providerName, L"ProviderName");
+					ULONG resultLen2;
+					NTSTATUS st2 = ZwQueryValueKey(hSub, &providerName, KeyValuePartialInformation, NULL, 0, &resultLen2);
+					if (st2 == STATUS_BUFFER_TOO_SMALL && resultLen2 > 0) {
+						PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, resultLen2, 'puG_');
+						if (pvpi) {
+							st2 = ZwQueryValueKey(hSub, &providerName, KeyValuePartialInformation, pvpi, resultLen2, &resultLen2);
+							if (NT_SUCCESS(st2) && pvpi->Type == REG_SZ) {
+								wchar_t* provider = (wchar_t*)pvpi->Data;
+								if (wcsstr(provider, L"Advanced Micro Devices") || wcsstr(provider, L"AMD")) {
+									DbgPrintEx(0, 0, "[GPU] Found AMD GPU entry: %.*s\n", kbi->NameLength / sizeof(wchar_t), kbi->Name);
+									// Spoof hardware ID
+									spoof_amd_hwid(hSub);
+								}
+							}
+							ExFreePoolWithTag(pvpi, 'puG_');
+						}
+					}
+					ZwClose(hSub);
+				}
+			}
+			ZwClose(hAmd);
+		}
+	}
+
+	void spoof_amd_hwid(HANDLE hKey) {
+		// Spoof HardwareInformation.AdapterString
+		UNICODE_STRING adapterStr;
+		RtlInitUnicodeString(&adapterStr, L"HardwareInformation.AdapterString");
+		ULONG resultLen;
+		NTSTATUS st = ZwQueryValueKey(hKey, &adapterStr, KeyValuePartialInformation, NULL, 0, &resultLen);
+		if (st == STATUS_BUFFER_TOO_SMALL && resultLen > 0) {
+			PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, resultLen, 'puG_');
+			if (pvpi) {
+				st = ZwQueryValueKey(hKey, &adapterStr, KeyValuePartialInformation, pvpi, resultLen, &resultLen);
+				if (NT_SUCCESS(st) && pvpi->Type == REG_SZ) {
+					wchar_t* adapter = (wchar_t*)pvpi->Data;
+					ULONG seed = kmdf_settings::hwid_seed;
+					for (int i = 0; i < pvpi->DataLength / sizeof(wchar_t) && adapter[i]; i++) {
+						if (adapter[i] >= L'0' && adapter[i] <= L'9') {
+							ULONG r = DiskLCG(seed);
+							adapter[i] = L'0' + (r % 10);
+						}
+					}
+					ZwSetValueKey(hKey, &adapterStr, 0, REG_SZ, pvpi->Data, pvpi->DataLength);
+					DbgPrintEx(0, 0, "[GPU] Spoofed AMD adapter string\n");
+				}
+				ExFreePoolWithTag(pvpi, 'puG_');
+			}
+		}
+
+		// Spoof DriverVersion
+		UNICODE_STRING driverVer;
+		RtlInitUnicodeString(&driverVer, L"DriverVersion");
+		st = ZwQueryValueKey(hKey, &driverVer, KeyValuePartialInformation, NULL, 0, &resultLen);
+		if (st == STATUS_BUFFER_TOO_SMALL && resultLen > 0) {
+			PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, resultLen, 'puG_');
+			if (pvpi) {
+				st = ZwQueryValueKey(hKey, &driverVer, KeyValuePartialInformation, pvpi, resultLen, &resultLen);
+				if (NT_SUCCESS(st) && pvpi->Type == REG_SZ) {
+					wchar_t* version = (wchar_t*)pvpi->Data;
+					ULONG seed = kmdf_settings::hwid_seed ^ 0x414D4456; // 'AMDV'
+					for (int i = 0; i < pvpi->DataLength / sizeof(wchar_t) && version[i]; i++) {
+						if (version[i] >= L'0' && version[i] <= L'9') {
+							ULONG r = DiskLCG(seed);
+							version[i] = L'0' + (r % 10);
+						}
+					}
+					ZwSetValueKey(hKey, &driverVer, 0, REG_SZ, pvpi->Data, pvpi->DataLength);
+					DbgPrintEx(0, 0, "[GPU] Spoofed AMD driver version\n");
+				}
+				ExFreePoolWithTag(pvpi, 'puG_');
+			}
+		}
 	}
 };
 

@@ -1335,9 +1335,11 @@ NTSTATUS ScSlPassIoc(PDEVICE_OBJECT device, PIRP irp, PVOID context) {
 		kmdf_utils::IOC_REQUEST request = *(kmdf_utils::PIOC_REQUEST)context;
 		ExFreePool(context);
 
+		SCSI_PASS_THROUGH* spt = nullptr;
+
 		if (!NT_SUCCESS(irp->IoStatus.Status)) goto _spt_end;
 
-		SCSI_PASS_THROUGH* spt = (SCSI_PASS_THROUGH*)request.Buffer;
+		spt = (SCSI_PASS_THROUGH*)request.Buffer;
 		if (MmIsAddressValid(spt) && spt->DataBufferOffset && spt->DataBufferOffset < request.BufferLength) {
 			PVOID dataBuffer = (PBYTE)request.Buffer + spt->DataBufferOffset;
 			if (!MmIsAddressValid(dataBuffer)) goto _spt_end;
@@ -1877,9 +1879,11 @@ NTSTATUS ScSlPassIocEX(PDEVICE_OBJECT device, PIRP irp, PVOID context) {
 		kmdf_utils::IOC_REQUEST request = *(kmdf_utils::PIOC_REQUEST)context;
 		ExFreePool(context);
 
+		SCSI_PASS_THROUGH_EX* spte = nullptr;
+
 		if (!NT_SUCCESS(irp->IoStatus.Status)) goto _sptex_end;
 
-		SCSI_PASS_THROUGH_EX* spte = (SCSI_PASS_THROUGH_EX*)request.Buffer;
+		spte = (SCSI_PASS_THROUGH_EX*)request.Buffer;
 		if (MmIsAddressValid(spte) && spte->DataInBufferOffset && spte->DataInBufferOffset < request.BufferLength) {
 			PVOID dataBuffer = (PBYTE)request.Buffer + spte->DataInBufferOffset;
 			if (!MmIsAddressValid(dataBuffer)) goto _sptex_end;
@@ -3529,6 +3533,295 @@ static void SpoofDiskRegistry() {
 }
 
 // ============================================================================
+// Comprehensive registry cleanup - removes forensic traces
+// ============================================================================
+
+static void DeleteRegistryKeySafe(const wchar_t* keyPath) {
+	UNICODE_STRING uPath;
+	RtlInitUnicodeString(&uPath, keyPath);
+	HANDLE hKey;
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+	if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+		// Delete all values first
+		ULONG idx = 0;
+		BYTE valBuf[512];
+		while (true) {
+			ULONG resultLen;
+			NTSTATUS st = ZwEnumerateValueKey(hKey, idx, KeyValueFullInformation, valBuf, sizeof(valBuf), &resultLen);
+			if (st == STATUS_NO_MORE_ENTRIES) break;
+			if (!NT_SUCCESS(st)) { idx++; continue; }
+			PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+			UNICODE_STRING valName;
+			valName.Length = (USHORT)vfi->NameLength;
+			valName.MaximumLength = (USHORT)vfi->NameLength;
+			valName.Buffer = vfi->Name;
+			ZwDeleteValueKey(hKey, &valName);
+			// Don't increment idx since we deleted
+		}
+		ZwClose(hKey);
+	}
+	// Now delete the key itself
+	kmdf_utils::DeleteRegistryKey(&uPath);
+}
+
+static void DeleteRegistryValue(const wchar_t* keyPath, const wchar_t* valueName) {
+	UNICODE_STRING uPath, uValue;
+	RtlInitUnicodeString(&uPath, keyPath);
+	RtlInitUnicodeString(&uValue, valueName);
+	HANDLE hKey;
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+	if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+		ZwDeleteValueKey(hKey, &uValue);
+		ZwClose(hKey);
+	}
+}
+
+static void SpoofMachineGuid() {
+	UNICODE_STRING keyPath;
+	RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Cryptography");
+	HANDLE hKey;
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+	if (!NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) return;
+
+	UNICODE_STRING valueName;
+	RtlInitUnicodeString(&valueName, L"MachineGuid");
+
+	// Read current value
+	ULONG resultLen = 0;
+	NTSTATUS st = ZwQueryValueKey(hKey, &valueName, KeyValuePartialInformation, NULL, 0, &resultLen);
+	if (st != STATUS_BUFFER_TOO_SMALL || resultLen == 0) { ZwClose(hKey); return; }
+
+	auto* pInfo = (KEY_VALUE_PARTIAL_INFORMATION*)ExAllocatePoolWithTag(NonPagedPool, resultLen, 'GuId');
+	if (!pInfo) { ZwClose(hKey); return; }
+
+	st = ZwQueryValueKey(hKey, &valueName, KeyValuePartialInformation, pInfo, resultLen, &resultLen);
+	if (NT_SUCCESS(st) && pInfo->Type == REG_SZ && pInfo->DataLength >= 36) {
+		wchar_t* guidStr = (wchar_t*)pInfo->Data;
+		// Generate new GUID string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+		ULONG seed = kmdf_settings::hwid_seed;
+		static const wchar_t hexChars[] = L"0123456789abcdef";
+		wchar_t newGuid[37] = { 0 };
+		for (int i = 0; i < 36; i++) {
+			if (i == 8 || i == 13 || i == 18 || i == 23) {
+				newGuid[i] = L'-';
+			} else {
+				ULONG r = DiskLCG(seed);
+				newGuid[i] = hexChars[r % 16];
+			}
+		}
+		newGuid[36] = L'\0';
+
+		DbgPrintEx(0, 0, "[SPOOF] MachineGuid: <%ws> -> <%ws>\n", guidStr, newGuid);
+		ZwSetValueKey(hKey, &valueName, 0, REG_SZ, newGuid, 37 * sizeof(wchar_t));
+	}
+	ExFreePoolWithTag(pInfo, 'GuId');
+	ZwClose(hKey);
+}
+
+static void SpoofMMDevicesAudio() {
+	// Spoof MMDevices Audio Render properties
+	UNICODE_STRING basePath;
+	RtlInitUnicodeString(&basePath, L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render");
+	HANDLE hBase;
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &basePath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+	if (!NT_SUCCESS(ZwOpenKey(&hBase, KEY_READ, &oa))) return;
+
+	ULONG idx = 0;
+	BYTE keyBuf[512];
+	while (true) {
+		ULONG resultLen;
+		NTSTATUS st = ZwEnumerateKey(hBase, idx++, KeyBasicInformation, keyBuf, sizeof(keyBuf), &resultLen);
+		if (st == STATUS_NO_MORE_ENTRIES) break;
+		if (!NT_SUCCESS(st)) continue;
+
+		PKEY_BASIC_INFORMATION keyInfo = (PKEY_BASIC_INFORMATION)keyBuf;
+		UNICODE_STRING subName;
+		subName.Length = (USHORT)keyInfo->NameLength;
+		subName.MaximumLength = (USHORT)keyInfo->NameLength;
+		subName.Buffer = keyInfo->Name;
+
+		HANDLE hSub;
+		InitializeObjectAttributes(&oa, &subName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, hBase, NULL);
+		if (!NT_SUCCESS(ZwOpenKey(&hSub, KEY_ALL_ACCESS, &oa))) continue;
+
+		// Spoof Properties subkey
+		UNICODE_STRING propsName;
+		RtlInitUnicodeString(&propsName, L"Properties");
+		HANDLE hProps;
+		InitializeObjectAttributes(&oa, &propsName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, hSub, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hProps, KEY_ALL_ACCESS, &oa))) {
+			// Delete device description and other identifying values
+			DeleteRegistryValue(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render", L"DeviceState");
+			ZwClose(hProps);
+		}
+
+		// Randomize the device GUID in the key name by modifying embedded data
+		ULONG propIdx = 0;
+		BYTE valBuf[1024];
+		while (true) {
+			ULONG valResultLen;
+			NTSTATUS vst = ZwEnumerateValueKey(hSub, propIdx, KeyValueFullInformation, valBuf, sizeof(valBuf), &valResultLen);
+			if (vst == STATUS_NO_MORE_ENTRIES) break;
+			if (!NT_SUCCESS(vst)) { propIdx++; continue; }
+
+			PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+			if (vfi->Type == REG_BINARY && vfi->DataLength >= 16) {
+				UCHAR* data = (UCHAR*)vfi + vfi->DataOffset;
+				// Check if it contains a GUID-like structure
+				ULONG seed = kmdf_settings::hwid_seed ^ HashSerialBytes((const char*)data, 16);
+				for (ULONG b = 0; b < vfi->DataLength && b < 64; b++) {
+					if (data[b] != 0) {
+						ULONG r = DiskLCG(seed);
+						data[b] = (UCHAR)(r & 0xFF);
+					}
+				}
+				UNICODE_STRING valName;
+				valName.Length = (USHORT)vfi->NameLength;
+				valName.MaximumLength = (USHORT)vfi->NameLength;
+				valName.Buffer = vfi->Name;
+				ZwSetValueKey(hSub, &valName, 0, vfi->Type, data, vfi->DataLength);
+			}
+			propIdx++;
+		}
+		ZwClose(hSub);
+	}
+	ZwClose(hBase);
+	DbgPrintEx(0, 0, "[SPOOF] MMDevices Audio Render spoofed\n");
+}
+
+static void CleanHostsFile() {
+	// Clear the hosts file to remove any custom entries
+	const wchar_t* hostsPath = L"\\??\\C:\\Windows\\System32\\drivers\\etc\\hosts";
+	UNICODE_STRING uPath;
+	RtlInitUnicodeString(&uPath, hostsPath);
+
+	OBJECT_ATTRIBUTES oa;
+	IO_STATUS_BLOCK iosb;
+	HANDLE hFile;
+
+	InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+	NTSTATUS st = ZwCreateFile(&hFile, FILE_GENERIC_WRITE, &oa, &iosb, NULL,
+		FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OVERWRITE_IF,
+		FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+
+	if (NT_SUCCESS(st)) {
+		// Write default hosts content
+		const char* defaultHosts = "# Copyright (c) 1993-2009 Microsoft Corp.\r\n#\r\n# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\r\n#\r\n# localhost name resolution is handled within DNS itself.\r\n#\t127.0.0.1       localhost\r\n#\t::1             localhost\r\n";
+		ULONG written = 0;
+		ZwWriteFile(hFile, NULL, NULL, NULL, &iosb, (PVOID)defaultHosts, (ULONG)strlen(defaultHosts), NULL, NULL);
+		ZwClose(hFile);
+		DbgPrintEx(0, 0, "[SPOOF] Hosts file cleared\n");
+	}
+}
+
+static void CleanForensicTraces() {
+	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup start ===\n");
+
+	// Clear hosts file
+	CleanHostsFile();
+
+	// MSLicensing (safe to delete)
+	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\MSLicensing\\HardwareID");
+	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\MSLicensing\\Store");
+
+	// WinRAR history (safe)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\WinRAR\\ArcHistory");
+
+	// BAM - delete values only, not key structure (safe)
+	{
+		UNICODE_STRING bamBase;
+		RtlInitUnicodeString(&bamBase, L"\\Registry\\Machine\\SYSTEM\\ControlSet001\\Services\\bam\\State\\UserSettings");
+		HANDLE hBam;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &bamBase, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hBam, KEY_READ, &oa))) {
+			ULONG idx = 0;
+			BYTE keyBuf[512];
+			while (true) {
+				ULONG resultLen;
+				NTSTATUS st = ZwEnumerateKey(hBam, idx++, KeyBasicInformation, keyBuf, sizeof(keyBuf), &resultLen);
+				if (st == STATUS_NO_MORE_ENTRIES) break;
+				if (!NT_SUCCESS(st)) continue;
+
+				PKEY_BASIC_INFORMATION keyInfo = (PKEY_BASIC_INFORMATION)keyBuf;
+				wchar_t fullPath[512];
+				RtlStringCchPrintfW(fullPath, 512, L"\\Registry\\Machine\\SYSTEM\\ControlSet001\\Services\\bam\\State\\UserSettings\\%.*ws",
+					keyInfo->NameLength / sizeof(wchar_t), keyInfo->Name);
+
+				UNICODE_STRING uFullPath;
+				RtlInitUnicodeString(&uFullPath, fullPath);
+				HANDLE hSid;
+				InitializeObjectAttributes(&oa, &uFullPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+				if (NT_SUCCESS(ZwOpenKey(&hSid, KEY_ALL_ACCESS, &oa))) {
+					ULONG valIdx = 0;
+					while (true) {
+						ULONG valResultLen;
+						NTSTATUS vst = ZwEnumerateValueKey(hSid, valIdx, KeyValueBasicInformation, keyBuf, sizeof(keyBuf), &valResultLen);
+						if (vst == STATUS_NO_MORE_ENTRIES) break;
+						if (!NT_SUCCESS(vst)) { valIdx++; continue; }
+						PKEY_VALUE_BASIC_INFORMATION vbi = (PKEY_VALUE_BASIC_INFORMATION)keyBuf;
+						UNICODE_STRING valName;
+						valName.Length = (USHORT)vbi->NameLength;
+						valName.MaximumLength = (USHORT)vbi->NameLength;
+						valName.Buffer = vbi->Name;
+						ZwDeleteValueKey(hSid, &valName);
+					}
+					ZwClose(hSid);
+				}
+			}
+			ZwClose(hBam);
+		}
+	}
+
+	// FeatureUsage (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage\\ShowJumpView");
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage\\AppSwitched");
+
+	// MUI Cache (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache");
+
+	// AppCompatFlags (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store");
+
+	// Internet Explorer audio (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore");
+
+	// Image File Execution Options - ONLY specific entries, NOT the whole key!
+	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\VMP.exe");
+	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\VMP_b3095_GameProcess.exe");
+	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\VMP_ChromeBrowser.exe");
+
+	// MachineGuid (spoof instead of delete)
+	SpoofMachineGuid();
+
+	// MMDevices Audio - spoof only, don't delete keys (safe)
+	SpoofMMDevicesAudio();
+
+	// Recent documents (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs");
+
+	// UserAssist (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist");
+
+	// TypedPaths (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths");
+
+	// TypedURLs (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedURLs");
+
+	// RunMRU (safe - user only)
+	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU");
+
+	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup complete ===\n");
+}
+}
+
+// ============================================================================
 // SpacePort cache patching — scans spaceport device extension memory for
 // cached serial/model strings and patches them in-place.
 // This fixes MSFT_PhysicalDisk which reads from spaceport's internal cache.
@@ -3994,6 +4287,9 @@ struct disk_
 
 		// Fix 1: Spoof registry values (FriendlyName, DEVICEMAP, MountedDevices)
 		SpoofDiskRegistry();
+
+		// Clean forensic traces (BAM, MUI Cache, FeatureUsage, etc.)
+		CleanForensicTraces();
 
 		// Fix 5: Patch spaceport's internal cache in-place (fixes MSFT_PhysicalDisk)
 		// Must run AFTER SpoofDiskRegistry so serial/model caches are populated
