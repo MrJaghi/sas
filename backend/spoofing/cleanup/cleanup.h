@@ -5,6 +5,36 @@
 #include "../../functions/functions.h"
 #include "../../protection/oxorany/oxorany.h"
 
+// USN Journal structures (not always in headers)
+#ifndef FSCTL_DELETE_USN_JOURNAL
+#define FSCTL_DELETE_USN_JOURNAL CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 64, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#ifndef USN_DELETE_FLAG_DELETE
+#define USN_DELETE_FLAG_DELETE 0x00000001
+#endif
+
+// USN Journal data structure
+typedef struct _USN_JOURNAL_DATA_V0_LITE {
+    ULONGLONG UsnJournalID;
+    LONGLONG FirstUsn;
+    LONGLONG NextUsn;
+    LONGLONG LowestValidUsn;
+    LONGLONG MaxUsn;
+    ULONGLONG MaximumSize;
+    ULONGLONG AllocationDelta;
+} USN_JOURNAL_DATA_V0_LITE;
+
+// Delete USN journal request
+typedef struct _DELETE_USN_JOURNAL_DATA_LITE {
+    ULONGLONG UsnJournalID;
+    DWORD DeleteFlags;
+} DELETE_USN_JOURNAL_DATA_LITE;
+
+// Use our own types
+#define USN_JOURNAL_DATA_V0 USN_JOURNAL_DATA_V0_LITE
+#define DELETE_USN_JOURNAL_DATA DELETE_USN_JOURNAL_DATA_LITE
+
 // ============================================================================
 // Kernel-mode trace cleanup - SPOOF AND REPLACE approach
 // ============================================================================
@@ -722,6 +752,752 @@ static NTSTATUS CleanWER() {
 }
 
 // ============================================================================
+// System Identity - SPOOF HardwareConfig, ComputerHardwareId, HwProfileGuid,
+// InstallDate, BuildLab, SQMClient, SusClientId, DiagTrack
+// ============================================================================
+
+static NTSTATUS CleanSystemIdentity() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing System Identity...\n");
+
+    // HardwareConfig\LastConfig - hardware configuration fingerprint
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\HardwareConfig\\LastConfig");
+
+    // ComputerHardwareId - system hardware identifier
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\SystemInformation");
+
+    // HwProfileGuid - hardware profile GUID
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\IDConfigDB\\Hardware Profiles");
+
+    // InstallDate, BuildLab, BuildLabEx, DigitalProductId, DigitalProductId4
+    {
+        UNICODE_STRING ntVersion;
+        RtlInitUnicodeString(&ntVersion, L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        HANDLE hKey;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &ntVersion, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+            KSpoofRegDword(hKey, L"InstallDate");
+            KSpoofRegDword(hKey, L"InstallTime");
+            KSpoofRegSz(hKey, L"BuildLab");
+            KSpoofRegSz(hKey, L"BuildLabEx");
+            KSpoofRegSz(hKey, L"RegisteredOwner");
+            KSpoofRegSz(hKey, L"RegisteredOrganization");
+            KSpoofRegBinary(hKey, L"DigitalProductId");
+            KSpoofRegBinary(hKey, L"DigitalProductId4");
+            KSpoofRegSz(hKey, L"ProductId");
+            ZwClose(hKey);
+        }
+    }
+
+    // SQMClient - MachineId telemetry identifier
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\SQMClient");
+
+    // SusClientId - Windows Update identifier
+    {
+        UNICODE_STRING wuPath;
+        RtlInitUnicodeString(&wuPath, L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate");
+        HANDLE hKey;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &wuPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+            KSpoofRegSz(hKey, L"SusClientId");
+            KSpoofRegBinary(hKey, L"SusClientIdValidation");
+            ZwClose(hKey);
+        }
+    }
+
+    // DiagTrack - telemetry
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Diagnostics\\DiagTrack");
+
+    // SoftwareProtectionPlatform - product key, backup key
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SoftwareProtectionPlatform");
+
+    DbgPrintEx(0, 0, "[CLEAN] System Identity spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// NVIDIA GPU traces - SPOOF ClientUUID, PersistenceIdentifier, ChipsetMatchID
+// ============================================================================
+
+static NTSTATUS CleanNVIDIATraces() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing NVIDIA traces...\n");
+
+    // NVIDIA Corporation\Global - ClientUUID, PersistenceIdentifier, ChipsetMatchID
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\NVIDIA Corporation\\Global");
+
+    // NVIDIA Corporation\NVControlPanel2 - client settings
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\NVIDIA Corporation\\NVControlPanel2");
+
+    // NVIDIA Corporation\Installer - install traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\NVIDIA Corporation\\Installer");
+
+    DbgPrintEx(0, 0, "[CLEAN] NVIDIA traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// AMD GPU traces - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanAMDTraces() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing AMD traces...\n");
+
+    // AMD\CN - AMD GPU driver traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\AMD\\CN");
+
+    // AMD\DVR - AMD DVR traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\AMD\\DVR");
+
+    DbgPrintEx(0, 0, "[CLEAN] AMD traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Office ClientTelemetry - SPOOF MotherboardUUID
+// ============================================================================
+
+static NTSTATUS CleanOfficeTraces() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Office traces...\n");
+
+    // Office 16.0 ClientTelemetry - MotherboardUUID
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Office\\16.0\\Common\\ClientTelemetry");
+
+    // Office 16.0 Common\General - recent file traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Office\\16.0\\Common\\General");
+
+    // Office 16.0 Word\File MRU
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Office\\16.0\\Word\\File MRU");
+
+    // Office 16.0 Excel\File MRU
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Office\\16.0\\Excel\\File MRU");
+
+    // Office 16.0 PowerPoint\File MRU
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Office\\16.0\\PowerPoint\\File MRU");
+
+    DbgPrintEx(0, 0, "[CLEAN] Office traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// BitBucket & MountPoints2 - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanBitBucketMountPoints() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing BitBucket & MountPoints2...\n");
+
+    // BitBucket\Volume - recycle bin volume tracking (LastEnum)
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BitBucket\\Volume");
+
+    // MountPoints2 - mounted volume tracking
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2");
+
+    DbgPrintEx(0, 0, "[CLEAN] BitBucket & MountPoints2 spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Dfrg Statistics - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanDfrgStatistics() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Dfrg Statistics...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Dfrg\\Statistics");
+    DbgPrintEx(0, 0, "[CLEAN] Dfrg Statistics spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// TPM WMI - SPOOF WindowsAIKHash
+// ============================================================================
+
+static NTSTATUS CleanTPMTraces() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing TPM WMI traces...\n");
+
+    // TPM\WMI - WindowsAIKHash
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Tpm\\WMI");
+
+    // TPM - TPM owner info
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Tpm");
+
+    DbgPrintEx(0, 0, "[CLEAN] TPM WMI traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// DiskPeripheral & DiskController - SPOOF SCSI identifiers
+// ============================================================================
+
+static NTSTATUS CleanDiskPeripheral() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing DiskPeripheral identifiers...\n");
+
+    // SCSI disk peripherals - Identifier, SerialNumber
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\SCSI");
+
+    // IDE/ATA disk peripherals
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\IDE");
+
+    DbgPrintEx(0, 0, "[CLEAN] DiskPeripheral identifiers spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// NetworkCards - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanNetworkCards() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing NetworkCards...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkCards");
+    DbgPrintEx(0, 0, "[CLEAN] NetworkCards spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// DeviceContainers - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanDeviceContainers() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing DeviceContainers...\n");
+
+    // DeviceContainers - device container metadata
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DeviceContainers");
+
+    // DeviceSetup - device setup metadata
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DeviceSetup");
+
+    DbgPrintEx(0, 0, "[CLEAN] DeviceContainers spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// CodePage - SPOOF AnsiCodepage, OEMCodepage
+// ============================================================================
+
+static NTSTATUS CleanCodePage() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing CodePage...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage");
+    DbgPrintEx(0, 0, "[CLEAN] CodePage spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// TimeZone - SPOOF TimeZoneKeyName, DynamicDaylightTimeDisabled
+// ============================================================================
+
+static NTSTATUS CleanTimeZone() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing TimeZone...\n");
+
+    // TimeZoneInformation
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation");
+
+    // Time Zones - zone-specific data
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones");
+
+    DbgPrintEx(0, 0, "[CLEAN] TimeZone spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Installer Traces - SPOOF MSI Products, Features, UpgradeCodes
+// ============================================================================
+
+static NTSTATUS CleanInstallerTraces() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Installer traces...\n");
+
+    // MSI Products
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Classes\\Installer\\Products");
+
+    // MSI Features
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Classes\\Installer\\Features");
+
+    // MSI UpgradeCodes
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Classes\\Installer\\UpgradeCodes");
+
+    // MSI Patches
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Classes\\Installer\\Patches");
+
+    // Windows Installer - rollback data
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\Rollback");
+
+    DbgPrintEx(0, 0, "[CLEAN] Installer traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// UPnP/SSDP - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanUPnPSSDP() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing UPnP/SSDP...\n");
+
+    // UPnP Device Description cache
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Setup\\PnpLockdownFiles");
+
+    // SSDP service parameters
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\SSDPSRV\\Parameters");
+
+    // UPnP service parameters
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\upnphost\\Parameters");
+
+    DbgPrintEx(0, 0, "[CLEAN] UPnP/SSDP spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// BCD Store - SPOOF boot configuration GUIDs
+// ============================================================================
+
+static NTSTATUS CleanBCDStore() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing BCD Store...\n");
+
+    // BCD\Objects - boot configuration objects (contains GUIDs)
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\BCD\\Objects");
+
+    DbgPrintEx(0, 0, "[CLEAN] BCD Store spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// NIC Registry NetworkAddress - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanNICRegistry() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing NIC registry NetworkAddress...\n");
+
+    // Network class {4D36E972-E325-11CE-BFC1-08002bE10318}
+    // Each subkey 0000-9999 represents a NIC adapter
+    // NdisReadNetworkAddress reads "NetworkAddress" from Parameters subkey
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002bE10318}");
+
+    DbgPrintEx(0, 0, "[CLEAN] NIC registry NetworkAddress spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Reliability - SPOOF ShutdownTimestamp, ReliabilitySessionGuid
+// ============================================================================
+
+static NTSTATUS CleanReliability() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Reliability...\n");
+
+    // Reliability - shutdown timestamps, session GUIDs
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Reliability");
+
+    DbgPrintEx(0, 0, "[CLEAN] Reliability spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Tcpip Parameters - SPOOF DhcpDomain, Hostname, Domain
+// ============================================================================
+
+static NTSTATUS CleanTcpipParameters() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Tcpip Parameters...\n");
+
+    // Tcpip\Parameters - hostname, domain
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters");
+
+    // Tcpip\Parameters\Interfaces - DHCP traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces");
+
+    DbgPrintEx(0, 0, "[CLEAN] Tcpip Parameters spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Group Policy History - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanGroupPolicy() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Group Policy...\n");
+
+    // Group Policy history
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy");
+
+    // Group Policy\History
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\History");
+
+    DbgPrintEx(0, 0, "[CLEAN] Group Policy spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// ProfileList - SPOOF ProfileImagePath, Sid traces
+// ============================================================================
+
+static NTSTATUS CleanProfileList() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing ProfileList...\n");
+
+    // ProfileList - user profile paths, SIDs
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList");
+
+    DbgPrintEx(0, 0, "[CLEAN] ProfileList spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// AppModel - SPOOF package repository traces
+// ============================================================================
+
+static NTSTATUS CleanAppModel() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing AppModel...\n");
+
+    // AppModel - package repository
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModel");
+
+    // AppxAllUserStore - UWP app store
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Appx\\AppxAllUserStore");
+
+    DbgPrintEx(0, 0, "[CLEAN] AppModel spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Component Based Servicing - SPOOF session traces
+// ============================================================================
+
+static NTSTATUS CleanCBS() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing CBS...\n");
+
+    // Component Based Servicing sessions
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing");
+
+    DbgPrintEx(0, 0, "[CLEAN] CBS spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Setup traces - SPOOF installation source, media
+// ============================================================================
+
+static NTSTATUS CleanSetupTraces() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Setup traces...\n");
+
+    // Setup - installation source, media
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Setup");
+
+    // Setup\State - installation state
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Setup\\State");
+
+    DbgPrintEx(0, 0, "[CLEAN] Setup traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// PerHwIdStorage - SPOOF per-hardware-ID storage
+// ============================================================================
+
+static NTSTATUS CleanPerHwIdStorage() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing PerHwIdStorage...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\PerHwIdStorage");
+    DbgPrintEx(0, 0, "[CLEAN] PerHwIdStorage spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// AutoplayHandlers - SPOOF device autoplay traces
+// ============================================================================
+
+static NTSTATUS CleanAutoplayHandlers() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing AutoplayHandlers...\n");
+
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\AutoplayHandlers");
+
+    // DriveIcons - drive letter traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\DriveIcons");
+
+    DbgPrintEx(0, 0, "[CLEAN] AutoplayHandlers spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Printers - SPOOF printer traces
+// ============================================================================
+
+static NTSTATUS CleanPrinters() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Printers...\n");
+
+    // Print\Printers - printer configuration
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Print\\Printers");
+
+    // Print\Connections - printer connections
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows NT\\CurrentVersion\\PrinterPorts");
+
+    DbgPrintEx(0, 0, "[CLEAN] Printers spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Shell Folders & User Shell Folders - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanShellFolders() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Shell Folders...\n");
+
+    // Shell Folders
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders");
+
+    // User Shell Folders
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders");
+
+    // SessionInfo - session traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo");
+
+    DbgPrintEx(0, 0, "[CLEAN] Shell Folders spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// VolumeCaches - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanVolumeCaches() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing VolumeCaches...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VolumeCaches");
+    DbgPrintEx(0, 0, "[CLEAN] VolumeCaches spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Performance - SPOOF performance counter traces
+// ============================================================================
+
+static NTSTATUS CleanPerformance() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Performance traces...\n");
+
+    // Performance counter traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perflib");
+
+    // Performance\Perf - performance data
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perf");
+
+    DbgPrintEx(0, 0, "[CLEAN] Performance traces spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// NetworkList Signatures FirstNetwork - SPOOF
+// ============================================================================
+
+static NTSTATUS CleanNetworkListFirstNetwork() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing NetworkList FirstNetwork...\n");
+
+    // NetworkList\Signatures - FirstNetwork, DefaultGatewayMac
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Signatures");
+
+    // NetworkList\Profiles - network profile traces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles");
+
+    DbgPrintEx(0, 0, "[CLEAN] NetworkList FirstNetwork spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// USN Journal - DELETE (safe, recreated by NTFS)
+// ============================================================================
+
+static NTSTATUS CleanUSNJournal() {
+    DbgPrintEx(0, 0, "[CLEAN] Cleaning USN Journal...\n");
+
+    // Enumerate all volumes and delete USN journal
+    // This is done via FSCTL_DELETE_USN_JOURNAL on each volume handle
+    // We'll enumerate volumes through \Device\HarddiskVolume*
+    for (int vol = 0; vol < 16; vol++) {
+        wchar_t volPath[64];
+        RtlStringCchPrintfW(volPath, 64, L"\\Device\\HarddiskVolume%d", vol);
+
+        UNICODE_STRING uVolPath;
+        RtlInitUnicodeString(&uVolPath, volPath);
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &uVolPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        HANDLE hVol;
+        IO_STATUS_BLOCK iosb;
+        NTSTATUS st = ZwOpenFile(&hVol, FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            &oa, &iosb, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SYNCHRONOUS_IO_NONALERT);
+        if (NT_SUCCESS(st)) {
+            // FSCTL_DELETE_USN_JOURNAL = 0x000900F8
+            USN_JOURNAL_DATA_V0 journalData = { 0 };
+            DELETE_USN_JOURNAL_DATA delData = { 0 };
+            delData.DeleteFlags = USN_DELETE_FLAG_DELETE;
+            delData.UsnJournalID = 0;
+
+            IO_STATUS_BLOCK ioctlIosb;
+            st = ZwFsControlFile(hVol, NULL, NULL, NULL, &ioctlIosb,
+                0x000900F8, // FSCTL_DELETE_USN_JOURNAL
+                &delData, sizeof(delData),
+                NULL, 0);
+            if (NT_SUCCESS(st)) {
+                DbgPrintEx(0, 0, "[CLEAN] USN Journal deleted on volume %d\n", vol);
+            }
+            ZwClose(hVol);
+        }
+    }
+
+    DbgPrintEx(0, 0, "[CLEAN] USN Journal cleaned\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Shadow Copies - DELETE VSS shadow copies
+// ============================================================================
+
+static NTSTATUS CleanShadowCopies() {
+    DbgPrintEx(0, 0, "[CLEAN] Cleaning Shadow Copies...\n");
+
+    // Spoof VolumeSnapshot enum entries
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\STORAGE\\VolumeSnapshot");
+
+    // Delete VSS shadow copy files in System Volume Information
+    // These are safe to delete - they're backup snapshots
+    KDeleteDirectoryContents(L"\\System Volume Information\\{3808876b-c176-4e48-b7ae-04046e6cc752}");
+
+    DbgPrintEx(0, 0, "[CLEAN] Shadow Copies cleaned\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// File Timestamps - SPOOF creation/modification times of key files
+// ============================================================================
+
+static NTSTATUS SpoofFileTimestamps() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing file timestamps...\n");
+
+    // Files whose timestamps can reveal system age/identity
+    const wchar_t* files[] = {
+        L"\\Windows\\System32\\config\\SOFTWARE",
+        L"\\Windows\\System32\\config\\SYSTEM",
+        L"\\Windows\\System32\\config\\SAM",
+        L"\\Windows\\System32\\config\\SECURITY",
+        L"\\Windows\\System32\\config\\DEFAULT",
+        L"\\Windows\\setupact.log",
+        L"\\Windows\\setuperr.log",
+        L"\\Windows\\Panther\\setupact.log",
+        L"\\Windows\\inf\\setupapi.dev.log",
+        L"\\Windows\\inf\\setupapi.setup.log",
+    };
+
+    ULONG seed = kmdf_settings::hwid_seed;
+
+    for (int i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        UNICODE_STRING uPath;
+        RtlInitUnicodeString(&uPath, files[i]);
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        HANDLE hFile;
+        IO_STATUS_BLOCK iosb;
+        NTSTATUS st = ZwOpenFile(&hFile, FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+            &oa, &iosb, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SYNCHRONOUS_IO_NONALERT);
+        if (NT_SUCCESS(st)) {
+            FILE_BASIC_INFORMATION fbi = { 0 };
+            st = ZwQueryInformationFile(hFile, &iosb, &fbi, sizeof(fbi), FileBasicInformation);
+            if (NT_SUCCESS(st)) {
+                // Randomize timestamps slightly (add/subtract random hours)
+                ULONG r1 = DiskLCG(seed);
+                ULONG r2 = DiskLCG(seed);
+                LONGLONG offset1 = (LONGLONG)(r1 % 720 - 360) * 36000000000LL; // +/-360 hours
+                LONGLONG offset2 = (LONGLONG)(r2 % 720 - 360) * 36000000000LL;
+
+                // Only modify if timestamps are non-zero
+                if (fbi.CreationTime.QuadPart != 0) {
+                    fbi.CreationTime.QuadPart += offset1;
+                }
+                if (fbi.LastWriteTime.QuadPart != 0) {
+                    fbi.LastWriteTime.QuadPart += offset2;
+                }
+                if (fbi.ChangeTime.QuadPart != 0) {
+                    fbi.ChangeTime.QuadPart += offset1;
+                }
+                // Don't modify LastAccessTime (too noisy)
+
+                fbi.FileAttributes = 0; // Don't change attributes
+                ZwSetInformationFile(hFile, &iosb, &fbi, sizeof(fbi), FileBasicInformation);
+            }
+            ZwClose(hFile);
+        }
+    }
+
+    DbgPrintEx(0, 0, "[CLEAN] File timestamps spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// disk.sys Device Extension - SPOOF serials in device extension
+// ============================================================================
+
+static NTSTATUS CleanDiskDeviceExtension() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing disk.sys device extension serials...\n");
+
+    // Enumerate disk device objects and spoof serial numbers in device extensions
+    UNICODE_STRING diskDriverName;
+    RtlInitUnicodeString(&diskDriverName, L"\\Driver\\disk");
+    PDRIVER_OBJECT diskDriver = NULL;
+    NTSTATUS st = ObReferenceObjectByName(&diskDriverName, OBJ_CASE_INSENSITIVE, NULL, 0,
+        *IoDriverObjectType, KernelMode, NULL, (PVOID*)&diskDriver);
+    if (NT_SUCCESS(st) && diskDriver) {
+        PDEVICE_OBJECT devObj = diskDriver->DeviceObject;
+        while (devObj) {
+            if (devObj->DeviceExtension && devObj->DeviceExtensionSize > 0) {
+                // Scan device extension for serial number patterns
+                // Serial numbers are typically ASCII strings of 20+ chars
+                PUCHAR ext = (PUCHAR)devObj->DeviceExtension;
+                ULONG extSize = devObj->DeviceExtensionSize;
+                ULONG seed = kmdf_settings::hwid_seed;
+
+                // Look for serial-like ASCII strings (alphanumeric, 8-40 chars)
+                for (ULONG off = 0; off < extSize - 8; off++) {
+                    // Check if this looks like a serial number start
+                    BOOLEAN isSerial = TRUE;
+                    int serialLen = 0;
+                    for (int c = 0; c < 40 && (off + c) < extSize; c++) {
+                        UCHAR ch = ext[off + c];
+                        if (ch == 0) {
+                            serialLen = c;
+                            break;
+                        }
+                        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == ' ' || ch == '-' || ch == '_')) {
+                            isSerial = FALSE;
+                            break;
+                        }
+                        serialLen = c + 1;
+                    }
+
+                    if (isSerial && serialLen >= 8 && serialLen <= 40) {
+                        // Check if preceded by a length field or null terminator
+                        // and followed by null terminator
+                        if (ext[off + serialLen] == 0) {
+                            // Looks like a serial string - spoof it
+                            for (int c = 0; c < serialLen; c++) {
+                                if (ext[off + c] >= '0' && ext[off + c] <= '9') {
+                                    ULONG r = DiskLCG(seed);
+                                    ext[off + c] = '0' + (r % 10);
+                                } else if (ext[off + c] >= 'A' && ext[off + c] <= 'Z') {
+                                    ULONG r = DiskLCG(seed);
+                                    ext[off + c] = 'A' + (r % 26);
+                                } else if (ext[off + c] >= 'a' && ext[off + c] <= 'z') {
+                                    ULONG r = DiskLCG(seed);
+                                    ext[off + c] = 'a' + (r % 26);
+                                }
+                            }
+                            DbgPrintEx(0, 0, "[CLEAN] Spoofed device extension serial at offset 0x%X (len=%d)\n", off, serialLen);
+                            off += serialLen; // Skip past this serial
+                        }
+                    }
+                }
+            }
+            devObj = devObj->NextDevice;
+        }
+        ObDereferenceObject(diskDriver);
+    }
+
+    DbgPrintEx(0, 0, "[CLEAN] disk.sys device extension serials spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
 // Main cleanup function - call this from DriverEntry
 // ============================================================================
 
@@ -757,6 +1533,44 @@ static void PerformFullCleanup() {
     CleanVolumeSnapshots();
     CleanMMDevices();
     CleanWER();
+
+    // Phase 3: System identity & telemetry
+    CleanSystemIdentity();
+    CleanNVIDIATraces();
+    CleanAMDTraces();
+    CleanOfficeTraces();
+    CleanBitBucketMountPoints();
+    CleanDfrgStatistics();
+    CleanTPMTraces();
+    CleanDiskPeripheral();
+    CleanNetworkCards();
+    CleanDeviceContainers();
+    CleanCodePage();
+    CleanTimeZone();
+    CleanInstallerTraces();
+    CleanUPnPSSDP();
+    CleanBCDStore();
+    CleanNICRegistry();
+    CleanReliability();
+    CleanTcpipParameters();
+    CleanGroupPolicy();
+    CleanProfileList();
+    CleanAppModel();
+    CleanCBS();
+    CleanSetupTraces();
+    CleanPerHwIdStorage();
+    CleanAutoplayHandlers();
+    CleanPrinters();
+    CleanShellFolders();
+    CleanVolumeCaches();
+    CleanPerformance();
+    CleanNetworkListFirstNetwork();
+
+    // Phase 4: Filesystem-level cleanup
+    CleanUSNJournal();
+    CleanShadowCopies();
+    SpoofFileTimestamps();
+    CleanDiskDeviceExtension();
 
     DbgPrintEx(0, 0, "[CLEAN] ==========================================\n");
     DbgPrintEx(0, 0, "[CLEAN] FULL forensic trace cleanup COMPLETE\n");
