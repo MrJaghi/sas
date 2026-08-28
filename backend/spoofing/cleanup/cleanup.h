@@ -1440,11 +1440,11 @@ static NTSTATUS CleanDiskDeviceExtension() {
     if (NT_SUCCESS(st) && diskDriver) {
         PDEVICE_OBJECT devObj = diskDriver->DeviceObject;
         while (devObj) {
-            if (devObj->DeviceExtension && devObj->DeviceExtensionSize > 0) {
+            if (devObj->DeviceExtension) {
                 // Scan device extension for serial number patterns
                 // Serial numbers are typically ASCII strings of 20+ chars
                 PUCHAR ext = (PUCHAR)devObj->DeviceExtension;
-                ULONG extSize = devObj->DeviceExtensionSize;
+                ULONG extSize = 4096; // Probe up to 4KB (typical device extension size)
                 ULONG seed = kmdf_settings::hwid_seed;
 
                 // Look for serial-like ASCII strings (alphanumeric, 8-40 chars)

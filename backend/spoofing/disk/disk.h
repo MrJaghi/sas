@@ -4021,6 +4021,24 @@ static void CleanForensicTraces() {
 
 	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup complete (SPOOF mode) ===\n");
 }
+
+// Scan a buffer for ASCII versions of known serials/models and replace
+static bool SpoofBufferContentAscii(char* buf, int bufLen) {
+	if (!buf || bufLen < 3) return false;
+	bool changed = false;
+
+	// Replace serial numbers
+	for (int i = 0; i < g_serialCount; i++) {
+		SerialCacheEntry* e = &g_serialCache[i];
+		int trimLen = e->sz;
+		while (trimLen > 0 && (e->orig[trimLen - 1] == ' ' || e->orig[trimLen - 1] == '\0')) trimLen--;
+		if (trimLen < 3) continue;
+
+		for (int pos = 0; pos + trimLen <= bufLen; pos++) {
+			if (!memcmp(buf + pos, e->orig, trimLen)) {
+				RtlCopyMemory(buf + pos, e->spoofed, trimLen);
+				changed = true;
+			}
 		}
 	}
 
