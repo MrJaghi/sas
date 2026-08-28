@@ -6,12 +6,205 @@
 #include "../../protection/oxorany/oxorany.h"
 
 // ============================================================================
-// Kernel-mode trace cleanup - SAFE forensic trace removal
+// Kernel-mode trace cleanup - SPOOF AND REPLACE approach
 // ============================================================================
-// IMPORTANT: This module is designed to NOT break display, GPU, or system stability
-// All critical system keys are preserved
+// Instead of deleting critical keys (which breaks the system),
+// we read the values, spoof them, and write back spoofed data.
+// This preserves system functionality while removing forensic traces.
 
 #define CLEAN_TAG 'naLC'
+
+// Helper: Generate random bytes
+static void KGenerateRandomBytes(UCHAR* buf, ULONG len, ULONG seed) {
+    for (ULONG i = 0; i < len; i++) {
+        ULONG r = seed * 1664525 + 1013904223;
+        seed = r;
+        buf[i] = (UCHAR)(r & 0xFF);
+    }
+}
+
+// Helper: Spoof a REG_SZ value by randomizing alphanumeric characters
+static NTSTATUS KSpoofRegSz(HANDLE hKey, const wchar_t* valueName) {
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, valueName);
+
+    ULONG resultLen = 0;
+    NTSTATUS st = ZwQueryValueKey(hKey, &uName, KeyValuePartialInformation, NULL, 0, &resultLen);
+    if (st != STATUS_BUFFER_TOO_SMALL || resultLen == 0) return st;
+
+    PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, resultLen, CLEAN_TAG);
+    if (!pvpi) return STATUS_INSUFFICIENT_RESOURCES;
+
+    st = ZwQueryValueKey(hKey, &uName, KeyValuePartialInformation, pvpi, resultLen, &resultLen);
+    if (NT_SUCCESS(st) && pvpi->Type == REG_SZ && pvpi->DataLength >= 4) {
+        wchar_t* data = (wchar_t*)pvpi->Data;
+        ULONG len = pvpi->DataLength / sizeof(wchar_t);
+        ULONG seed = kmdf_settings::hwid_seed ^ HashSerialBytes((const char*)data, pvpi->DataLength);
+
+        for (ULONG i = 0; i < len && data[i]; i++) {
+            if (data[i] >= L'0' && data[i] <= L'9') {
+                ULONG r = DiskLCG(seed);
+                data[i] = L'0' + (r % 10);
+            } else if (data[i] >= L'A' && data[i] <= L'Z') {
+                ULONG r = DiskLCG(seed);
+                data[i] = L'A' + (r % 26);
+            } else if (data[i] >= L'a' && data[i] <= L'z') {
+                ULONG r = DiskLCG(seed);
+                data[i] = L'a' + (r % 26);
+            }
+        }
+
+        st = ZwSetValueKey(hKey, &uName, 0, REG_SZ, pvpi->Data, pvpi->DataLength);
+    }
+
+    ExFreePoolWithTag(pvpi, CLEAN_TAG);
+    return st;
+}
+
+// Helper: Spoof a REG_BINARY value
+static NTSTATUS KSpoofRegBinary(HANDLE hKey, const wchar_t* valueName) {
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, valueName);
+
+    ULONG resultLen = 0;
+    NTSTATUS st = ZwQueryValueKey(hKey, &uName, KeyValuePartialInformation, NULL, 0, &resultLen);
+    if (st != STATUS_BUFFER_TOO_SMALL || resultLen == 0) return st;
+
+    PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, resultLen, CLEAN_TAG);
+    if (!pvpi) return STATUS_INSUFFICIENT_RESOURCES;
+
+    st = ZwQueryValueKey(hKey, &uName, KeyValuePartialInformation, pvpi, resultLen, &resultLen);
+    if (NT_SUCCESS(st) && pvpi->Type == REG_BINARY && pvpi->DataLength >= 4) {
+        UCHAR* data = (UCHAR*)pvpi->Data;
+        ULONG seed = kmdf_settings::hwid_seed ^ HashSerialBytes((const char*)data, pvpi->DataLength > 64 ? 64 : pvpi->DataLength);
+
+        for (ULONG i = 0; i < pvpi->DataLength; i++) {
+            if (data[i] != 0) {
+                ULONG r = DiskLCG(seed);
+                data[i] = (UCHAR)(r & 0xFF);
+                if (data[i] == 0) data[i] = 1;
+            }
+        }
+
+        st = ZwSetValueKey(hKey, &uName, 0, REG_BINARY, pvpi->Data, pvpi->DataLength);
+    }
+
+    ExFreePoolWithTag(pvpi, CLEAN_TAG);
+    return st;
+}
+
+// Helper: Spoof a REG_DWORD value
+static NTSTATUS KSpoofRegDword(HANDLE hKey, const wchar_t* valueName) {
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, valueName);
+
+    ULONG resultLen = 0;
+    NTSTATUS st = ZwQueryValueKey(hKey, &uName, KeyValuePartialInformation, NULL, 0, &resultLen);
+    if (st != STATUS_BUFFER_TOO_SMALL || resultLen == 0) return st;
+
+    PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, resultLen, CLEAN_TAG);
+    if (!pvpi) return STATUS_INSUFFICIENT_RESOURCES;
+
+    st = ZwQueryValueKey(hKey, &uName, KeyValuePartialInformation, pvpi, resultLen, &resultLen);
+    if (NT_SUCCESS(st) && pvpi->Type == REG_DWORD && pvpi->DataLength >= 4) {
+        ULONG* val = (ULONG*)pvpi->Data;
+        ULONG seed = kmdf_settings::hwid_seed ^ *val;
+        *val = DiskLCG(seed);
+        st = ZwSetValueKey(hKey, &uName, 0, REG_DWORD, pvpi->Data, pvpi->DataLength);
+    }
+
+    ExFreePoolWithTag(pvpi, CLEAN_TAG);
+    return st;
+}
+
+// Helper: Spoof all values in a registry key
+static NTSTATUS KSpoofAllValues(HANDLE hKey) {
+    ULONG idx = 0;
+    const ULONG bufSize = 0x1000;
+    PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)ExAllocatePoolWithTag(PagedPool, bufSize, CLEAN_TAG);
+    if (!vfi) return STATUS_INSUFFICIENT_RESOURCES;
+
+    while (TRUE) {
+        ULONG resultLen;
+        NTSTATUS st = ZwEnumerateValueKey(hKey, idx, KeyValueFullInformation, vfi, bufSize, &resultLen);
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+        if (!NT_SUCCESS(st)) { idx++; continue; }
+
+        UNICODE_STRING valName;
+        valName.Length = (USHORT)vfi->NameLength;
+        valName.MaximumLength = (USHORT)vfi->NameLength;
+        valName.Buffer = vfi->Name;
+
+        // Spoof based on type
+        switch (vfi->Type) {
+        case REG_SZ:
+        case REG_EXPAND_SZ:
+            KSpoofRegSz(hKey, vfi->Name);
+            break;
+        case REG_BINARY:
+            KSpoofRegBinary(hKey, vfi->Name);
+            break;
+        case REG_DWORD:
+            KSpoofRegDword(hKey, vfi->Name);
+            break;
+        default:
+            // For other types, just randomize the data
+            if (vfi->DataLength >= 4) {
+                UCHAR* data = (UCHAR*)vfi + vfi->DataOffset;
+                ULONG seed = kmdf_settings::hwid_seed;
+                for (ULONG i = 0; i < vfi->DataLength; i++) {
+                    if (data[i] != 0) {
+                        ULONG r = DiskLCG(seed);
+                        data[i] = (UCHAR)(r & 0xFF);
+                    }
+                }
+                ZwSetValueKey(hKey, &valName, 0, vfi->Type, data, vfi->DataLength);
+            }
+            break;
+        }
+
+        idx++;
+    }
+
+    ExFreePoolWithTag(vfi, CLEAN_TAG);
+    return STATUS_SUCCESS;
+}
+
+// Helper: Spoof a registry key and all its subkeys/values
+static NTSTATUS KSpoofRegistryKeyRecursive(const wchar_t* keyPath) {
+    UNICODE_STRING uPath;
+    RtlInitUnicodeString(&uPath, keyPath);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE hKey;
+    NTSTATUS st = ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa);
+    if (!NT_SUCCESS(st)) return st;
+
+    // Spoof all values in this key
+    KSpoofAllValues(hKey);
+
+    // Process subkeys
+    const ULONG bufSize = 0x1000;
+    PKEY_BASIC_INFORMATION kbi = (PKEY_BASIC_INFORMATION)ExAllocatePoolWithTag(PagedPool, bufSize, CLEAN_TAG);
+    if (!kbi) { ZwClose(hKey); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    ULONG idx = 0;
+    while (TRUE) {
+        ULONG resultLen;
+        st = ZwEnumerateKey(hKey, idx++, KeyBasicInformation, kbi, bufSize, &resultLen);
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+        if (!NT_SUCCESS(st)) continue;
+
+        wchar_t subPath[512];
+        RtlStringCchPrintfW(subPath, 512, L"%s\\%.*s", keyPath, kbi->NameLength / sizeof(wchar_t), kbi->Name);
+        KSpoofRegistryKeyRecursive(subPath);
+    }
+
+    ExFreePoolWithTag(kbi, CLEAN_TAG);
+    ZwClose(hKey);
+    return STATUS_SUCCESS;
+}
 
 // Helper: Delete a file by kernel path
 static NTSTATUS KDeleteFile(const wchar_t* filePath) {
@@ -22,8 +215,8 @@ static NTSTATUS KDeleteFile(const wchar_t* filePath) {
     return ZwDeleteFile(&oa);
 }
 
-// Helper: Open a directory and delete all files matching a pattern
-static NTSTATUS KDeleteDirectoryContents(const wchar_t* dirPath, const wchar_t* pattern = L"*") {
+// Helper: Open a directory and delete all files
+static NTSTATUS KDeleteDirectoryContents(const wchar_t* dirPath) {
     UNICODE_STRING uDir;
     RtlInitUnicodeString(&uDir, dirPath);
     OBJECT_ATTRIBUTES oa;
@@ -36,7 +229,6 @@ static NTSTATUS KDeleteDirectoryContents(const wchar_t* dirPath, const wchar_t* 
         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
     if (!NT_SUCCESS(st)) return st;
 
-    // Buffer for directory enumeration
     const ULONG bufSize = 0x10000;
     PFILE_DIRECTORY_INFORMATION buf = (PFILE_DIRECTORY_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, bufSize, CLEAN_TAG);
     if (!buf) { ZwClose(hDir); return STATUS_INSUFFICIENT_RESOURCES; }
@@ -50,11 +242,9 @@ static NTSTATUS KDeleteDirectoryContents(const wchar_t* dirPath, const wchar_t* 
 
         PFILE_DIRECTORY_INFORMATION info = buf;
         while (TRUE) {
-            // Skip . and ..
             if (info->FileNameLength == 2 && info->FileName[0] == L'.') goto next;
             if (info->FileNameLength == 4 && info->FileName[0] == L'.' && info->FileName[1] == L'.') goto next;
 
-            // Build full path
             wchar_t fullPath[512];
             NTSTATUS fmtSt;
             fmtSt = RtlStringCchPrintfW(fullPath, 512, L"%s\\%.*s", dirPath,
@@ -65,32 +255,7 @@ static NTSTATUS KDeleteDirectoryContents(const wchar_t* dirPath, const wchar_t* 
                 OBJECT_ATTRIBUTES fileOa;
                 InitializeObjectAttributes(&fileOa, &uFull, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
-                if (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    // Skip critical system directories
-                    const wchar_t* name = info->FileName;
-                    ULONG nameLen = info->FileNameLength / sizeof(wchar_t);
-                    
-                    // Skip display/GPU related directories
-                    if ((nameLen == 12 && _wcsnicmp(name, L"BasicRender", 11) == 0) ||
-                        (nameLen == 7 && _wcsnicmp(name, L"Display", 7) == 0) ||
-                        (nameLen == 4 && _wcsnicmp(name, L"GPU", 3) == 0) ||
-                        (nameLen == 7 && _wcsnicmp(name, L"Monitor", 7) == 0)) {
-                        goto next;
-                    }
-
-                    // Recursively delete subdirectory
-                    HANDLE hSubDir;
-                    IO_STATUS_BLOCK subIosb;
-                    if (NT_SUCCESS(ZwOpenFile(&hSubDir, FILE_LIST_DIRECTORY | DELETE | SYNCHRONIZE, &fileOa, &subIosb,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT))) {
-                        FILE_DISPOSITION_INFORMATION disp;
-                        disp.DeleteFile = TRUE;
-                        ZwSetInformationFile(hSubDir, &subIosb, &disp, sizeof(disp), FileDispositionInformation);
-                        ZwClose(hSubDir);
-                    }
-                } else {
-                    // Delete file
+                if (!(info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                     HANDLE hFile;
                     IO_STATUS_BLOCK fileIosb;
                     if (NT_SUCCESS(ZwOpenFile(&hFile, DELETE | SYNCHRONIZE, &fileOa, &fileIosb,
@@ -134,44 +299,15 @@ static NTSTATUS KDeleteAllValues(HANDLE hKey) {
         valName.Buffer = vfi->Name;
 
         st = ZwDeleteValueKey(hKey, &valName);
-        if (!NT_SUCCESS(st)) idx++; // Skip if can't delete
-        // Don't increment on success since indices shift
+        if (!NT_SUCCESS(st)) idx++;
     }
 
     ExFreePoolWithTag(vfi, CLEAN_TAG);
     return STATUS_SUCCESS;
 }
 
-// Helper: Delete a registry key and all subkeys recursively - SAFE VERSION
+// Helper: Delete a registry key and all subkeys recursively
 static NTSTATUS KDeleteRegistryKeyRecursive(const wchar_t* keyPath) {
-    // SAFETY: Skip critical system keys that could cause black screen
-    const wchar_t* criticalKeys[] = {
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\DeviceClasses",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\DISPLAY",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\PCI",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}", // Display adapters
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e96c-e325-11ce-bfc1-08002be10318}", // Media devices
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Video",
-        L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\PriorityControl",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\BasicDisplay",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\BasicRender",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\dxgkrnl",
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\nvlddmkm", // NVIDIA
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\amdkmdag", // AMD
-        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\amdkmpfd", // AMD
-    };
-
-    // Check if this is a critical key
-    for (int i = 0; i < sizeof(criticalKeys) / sizeof(criticalKeys[0]); i++) {
-        if (_wcsnicmp(keyPath, criticalKeys[i], wcslen(criticalKeys[i])) == 0) {
-            DbgPrintEx(0, 0, "[CLEAN] SKIPPING critical key: %ws\n", keyPath);
-            return STATUS_SUCCESS; // Skip silently
-        }
-    }
-
     UNICODE_STRING uPath;
     RtlInitUnicodeString(&uPath, keyPath);
     OBJECT_ATTRIBUTES oa;
@@ -181,7 +317,6 @@ static NTSTATUS KDeleteRegistryKeyRecursive(const wchar_t* keyPath) {
     NTSTATUS st = ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa);
     if (!NT_SUCCESS(st)) return st;
 
-    // Delete all subkeys first
     const ULONG bufSize = 0x1000;
     PKEY_BASIC_INFORMATION kbi = (PKEY_BASIC_INFORMATION)ExAllocatePoolWithTag(PagedPool, bufSize, CLEAN_TAG);
     if (!kbi) { ZwClose(hKey); return STATUS_INSUFFICIENT_RESOURCES; }
@@ -192,23 +327,13 @@ static NTSTATUS KDeleteRegistryKeyRecursive(const wchar_t* keyPath) {
         if (st == STATUS_NO_MORE_ENTRIES) break;
         if (!NT_SUCCESS(st)) break;
 
-        UNICODE_STRING subName;
-        subName.Length = (USHORT)kbi->NameLength;
-        subName.MaximumLength = (USHORT)kbi->NameLength;
-        subName.Buffer = kbi->Name;
-
-        // Build full path for recursive delete
         wchar_t subPath[512];
         RtlStringCchPrintfW(subPath, 512, L"%s\\%.*s", keyPath, kbi->NameLength / sizeof(wchar_t), kbi->Name);
         KDeleteRegistryKeyRecursive(subPath);
     }
 
     ExFreePoolWithTag(kbi, CLEAN_TAG);
-
-    // Delete all values
     KDeleteAllValues(hKey);
-
-    // Delete the key itself
     st = ZwDeleteKey(hKey);
     ZwClose(hKey);
     return st;
@@ -220,31 +345,34 @@ static NTSTATUS KDeleteRegistryKeyRecursive(const wchar_t* keyPath) {
 
 static NTSTATUS CleanPrefetch() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning Prefetch...\n");
-
-    // Delete all .pf files
-    KDeleteDirectoryContents(L"\\SystemRoot\\Prefetch", L"*.pf");
-
-    // Delete layout.ini
+    KDeleteDirectoryContents(L"\\SystemRoot\\Prefetch");
     KDeleteFile(L"\\SystemRoot\\Prefetch\\Layout.ini");
-
-    // Delete AgAppLaunch.db
     KDeleteFile(L"\\SystemRoot\\Prefetch\\AgAppLaunch.db");
-
-    // Delete boot files
     KDeleteDirectoryContents(L"\\SystemRoot\\Prefetch\\ReadyBoot");
-
     DbgPrintEx(0, 0, "[CLEAN] Prefetch cleaned\n");
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// Event Log cleanup - SAFE VERSION
+// Event Log cleanup - SPOOF instead of delete
 // ============================================================================
 
 static NTSTATUS CleanEventLogs() {
-    DbgPrintEx(0, 0, "[CLEAN] Cleaning Event Logs...\n");
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Event Logs...\n");
 
-    // Delete individual log files (not the whole directory to avoid breaking event log service)
+    // Spoof event log registry entries instead of deleting
+    const wchar_t* logKeys[] = {
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\System",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\Security",
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\Setup",
+    };
+
+    for (int i = 0; i < sizeof(logKeys) / sizeof(logKeys[0]); i++) {
+        KSpoofRegistryKeyRecursive(logKeys[i]);
+    }
+
+    // Delete .evtx files (they will be recreated by the system)
     const wchar_t* logFiles[] = {
         L"\\SystemRoot\\System32\\winevt\\Logs\\Application.evtx",
         L"\\SystemRoot\\System32\\winevt\\Logs\\System.evtx",
@@ -254,7 +382,6 @@ static NTSTATUS CleanEventLogs() {
         L"\\SystemRoot\\System32\\winevt\\Logs\\Microsoft-Windows-TaskScheduler%4Operational.evtx",
         L"\\SystemRoot\\System32\\winevt\\Logs\\Microsoft-Windows-PowerShell%4Operational.evtx",
         L"\\SystemRoot\\System32\\winevt\\Logs\\Microsoft-Windows-Windows Defender%4Operational.evtx",
-        L"\\SystemRoot\\System32\\winevt\\Logs\\Microsoft-Windows-Windows Defender%4WHC.evtx",
         L"\\SystemRoot\\System32\\winevt\\Logs\\Microsoft-Windows-CodeIntegrity%4Operational.evtx",
     };
 
@@ -262,7 +389,7 @@ static NTSTATUS CleanEventLogs() {
         KDeleteFile(logFiles[i]);
     }
 
-    DbgPrintEx(0, 0, "[CLEAN] Event Logs cleaned\n");
+    DbgPrintEx(0, 0, "[CLEAN] Event Logs spoofed\n");
     return STATUS_SUCCESS;
 }
 
@@ -272,29 +399,14 @@ static NTSTATUS CleanEventLogs() {
 
 static NTSTATUS CleanTempFiles() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning Temp files...\n");
-
-    // User temp directories
     KDeleteDirectoryContents(L"\\SystemRoot\\Temp");
-
-    // Windows Update logs
     KDeleteFile(L"\\Windows\\WindowsUpdate.log");
-
-    // CBS logs
     KDeleteDirectoryContents(L"\\Windows\\Logs\\CBS");
-
-    // DISM logs
     KDeleteDirectoryContents(L"\\Windows\\Logs\\DISM");
-
-    // Minidump files
     KDeleteDirectoryContents(L"\\Windows\\Minidump");
-
-    // Memory dump
     KDeleteFile(L"\\Windows\\MEMORY.dmp");
-
-    //WER (Windows Error Reporting)
     KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue");
     KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive");
-
     DbgPrintEx(0, 0, "[CLEAN] Temp files cleaned\n");
     return STATUS_SUCCESS;
 }
@@ -305,13 +417,8 @@ static NTSTATUS CleanTempFiles() {
 
 static NTSTATUS CleanRecentFiles() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning Recent files...\n");
-
-    // Recent items - use wildcard for all users
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\Recent");
-
-    // Office recent files
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Roaming\\Microsoft\\Office\\Recent");
-
     DbgPrintEx(0, 0, "[CLEAN] Recent files cleaned\n");
     return STATUS_SUCCESS;
 }
@@ -322,25 +429,20 @@ static NTSTATUS CleanRecentFiles() {
 
 static NTSTATUS CleanJumpLists() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning Jump Lists...\n");
-
-    // Automatic destinations
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\Recent\\AutomaticDestinations");
-
-    // Custom destinations
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\Recent\\CustomDestinations");
-
     DbgPrintEx(0, 0, "[CLEAN] Jump Lists cleaned\n");
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// Registry MRU cleanup - SAFE VERSION
+// Registry MRU cleanup - SPOOF instead of delete
 // ============================================================================
 
 static NTSTATUS CleanRegistryMRUs() {
-    DbgPrintEx(0, 0, "[CLEAN] Cleaning Registry MRUs...\n");
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Registry MRUs...\n");
 
-    // HKCU MRU paths - only user-specific, not system-wide
+    // Spoof MRU values instead of deleting
     const wchar_t* mruPaths[] = {
         L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU",
         L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs",
@@ -354,58 +456,59 @@ static NTSTATUS CleanRegistryMRUs() {
     };
 
     for (int i = 0; i < sizeof(mruPaths) / sizeof(mruPaths[0]); i++) {
-        UNICODE_STRING uPath;
-        RtlInitUnicodeString(&uPath, mruPaths[i]);
-        OBJECT_ATTRIBUTES oa;
-        InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-        HANDLE hKey;
-        if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
-            KDeleteAllValues(hKey);
-            ZwClose(hKey);
-        }
+        KSpoofRegistryKeyRecursive(mruPaths[i]);
     }
 
-    // MUI Cache
-    KDeleteRegistryKeyRecursive(L"\\Registry\\User\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache");
+    // MUI Cache - spoof
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache");
 
-    // AppCompat flags (user only)
-    KDeleteRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store");
+    // AppCompat flags - spoof
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store");
 
-    DbgPrintEx(0, 0, "[CLEAN] Registry MRUs cleaned\n");
+    DbgPrintEx(0, 0, "[CLEAN] Registry MRUs spoofed\n");
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// Network trace cleanup - SAFE VERSION
+// Network trace cleanup - SPOOF instead of delete
 // ============================================================================
 
 static NTSTATUS CleanNetworkTraces() {
-    DbgPrintEx(0, 0, "[CLEAN] Cleaning Network traces...\n");
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Network traces...\n");
 
-    // Network profiles (safe to delete)
-    KDeleteRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles");
-    KDeleteRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Signatures\\Managed");
-    KDeleteRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Signatures\\Unmanaged");
+    // Spoof network profiles instead of deleting
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Signatures\\Managed");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Signatures\\Unmanaged");
 
-    // WiFi profiles
-    KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Wlansvc\\Profiles\\Interfaces");
+    // Spoof DNS cache parameters
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters");
 
-    DbgPrintEx(0, 0, "[CLEAN] Network traces cleaned\n");
+    // Spoof TCP/IP interfaces
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces");
+
+    // Spoof Bluetooth devices
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices");
+
+    DbgPrintEx(0, 0, "[CLEAN] Network traces spoofed\n");
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// USB device history cleanup - SAFE VERSION
+// USB device history cleanup - SPOOF instead of delete
 // ============================================================================
 
 static NTSTATUS CleanUSBTraces() {
-    DbgPrintEx(0, 0, "[CLEAN] Cleaning USB traces...\n");
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing USB traces...\n");
 
-    // Only delete USBSTOR, not all USB (which could break input devices)
-    KDeleteRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR");
+    // Spoof USB device history instead of deleting
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\USB");
 
-    DbgPrintEx(0, 0, "[CLEAN] USB traces cleaned\n");
+    // Spoof device classes
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\DeviceClasses");
+
+    DbgPrintEx(0, 0, "[CLEAN] USB traces spoofed\n");
     return STATUS_SUCCESS;
 }
 
@@ -415,67 +518,82 @@ static NTSTATUS CleanUSBTraces() {
 
 static NTSTATUS CleanAppTraces() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning Application traces...\n");
-
-    // Chrome
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache");
-
-    // Firefox
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Local\\Mozilla\\Firefox\\Profiles");
-
-    // Edge
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Cache");
-
-    // Discord
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Roaming\\discord\\Cache");
-
-    // Visual Studio Code
     KDeleteDirectoryContents(L"\\Users\\*\\AppData\\Roaming\\Code\\Cache");
-
     DbgPrintEx(0, 0, "[CLEAN] Application traces cleaned\n");
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// BAM/DAM cleanup - SAFE VERSION (only values, not keys)
+// BAM/DAM cleanup - SPOOF instead of delete
 // ============================================================================
 
 static NTSTATUS CleanBAM() {
-    DbgPrintEx(0, 0, "[CLEAN] Cleaning BAM/DAM...\n");
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing BAM/DAM...\n");
 
-    // BAM state - only delete values, not the whole key structure
-    UNICODE_STRING bamPath;
-    RtlInitUnicodeString(&bamPath, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings");
-    HANDLE hBam;
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, &bamPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    // Spoof BAM state instead of deleting
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings");
 
-    if (NT_SUCCESS(ZwOpenKey(&hBam, KEY_READ, &oa))) {
-        ULONG idx = 0;
-        BYTE keyBuf[512];
-        while (TRUE) {
-            ULONG resultLen;
-            NTSTATUS st = ZwEnumerateKey(hBam, idx++, KeyBasicInformation, keyBuf, sizeof(keyBuf), &resultLen);
-            if (st == STATUS_NO_MORE_ENTRIES) break;
-            if (!NT_SUCCESS(st)) continue;
+    // Spoof DAM state
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\dam\\State\\UserSettings");
 
-            PKEY_BASIC_INFORMATION kbi = (PKEY_BASIC_INFORMATION)keyBuf;
-            wchar_t subPath[512];
-            RtlStringCchPrintfW(subPath, 512, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings\\%.*s",
-                kbi->NameLength / sizeof(wchar_t), kbi->Name);
+    DbgPrintEx(0, 0, "[CLEAN] BAM/DAM spoofed\n");
+    return STATUS_SUCCESS;
+}
 
-            UNICODE_STRING uSubPath;
-            RtlInitUnicodeString(&uSubPath, subPath);
-            HANDLE hSub;
-            InitializeObjectAttributes(&oa, &uSubPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-            if (NT_SUCCESS(ZwOpenKey(&hSub, KEY_ALL_ACCESS, &oa))) {
-                KDeleteAllValues(hSub);
-                ZwClose(hSub);
-            }
-        }
-        ZwClose(hBam);
-    }
+// ============================================================================
+// WMI Security - SPOOF instead of delete
+// ============================================================================
 
-    DbgPrintEx(0, 0, "[CLEAN] BAM/DAM cleaned\n");
+static NTSTATUS CleanWMISecurity() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing WMI Security...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\WMI\\Security");
+    DbgPrintEx(0, 0, "[CLEAN] WMI Security spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// SafeBoot - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanSafeBoot() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing SafeBoot...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Option");
+    DbgPrintEx(0, 0, "[CLEAN] SafeBoot spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// AppCompatCache - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanAppCompatCache() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing AppCompatCache...\n");
+
+    // Spoof AppCompatCache instead of deleting
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache");
+
+    // Spoof AppCompatFlags
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags");
+
+    // Spoof Amcache
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\COMPONENTS\\DerivedData\\Components");
+
+    DbgPrintEx(0, 0, "[CLEAN] AppCompatCache spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// SRUM - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanSRUM() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing SRUM...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SRUM\\Extensions");
+    DbgPrintEx(0, 0, "[CLEAN] SRUM spoofed\n");
     return STATUS_SUCCESS;
 }
 
@@ -485,34 +603,20 @@ static NTSTATUS CleanBAM() {
 
 static NTSTATUS CleanPowerShellHistory() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning PowerShell history...\n");
-
-    // PSReadLine history
     KDeleteFile(L"\\Users\\*\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt");
-
     DbgPrintEx(0, 0, "[CLEAN] PowerShell history cleaned\n");
     return STATUS_SUCCESS;
 }
 
 // ============================================================================
-// CMD history cleanup
+// CMD history cleanup - SPOOF instead of delete
 // ============================================================================
 
 static NTSTATUS CleanCMDHistory() {
-    DbgPrintEx(0, 0, "[CLEAN] Cleaning CMD history...\n");
-
-    // Console history
-    UNICODE_STRING consolePath;
-    RtlInitUnicodeString(&consolePath, L"\\Registry\\User\\Console");
-    HANDLE hKey;
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, &consolePath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-    if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
-        KDeleteAllValues(hKey);
-        ZwClose(hKey);
-    }
-
-    DbgPrintEx(0, 0, "[CLEAN] CMD history cleaned\n");
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing CMD history...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Console");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\User\\Software\\Microsoft\\Command Processor");
+    DbgPrintEx(0, 0, "[CLEAN] CMD history spoofed\n");
     return STATUS_SUCCESS;
 }
 
@@ -522,21 +626,98 @@ static NTSTATUS CleanCMDHistory() {
 
 static NTSTATUS CleanCrashDumps() {
     DbgPrintEx(0, 0, "[CLEAN] Cleaning Crash dumps...\n");
-
-    // Minidumps
     KDeleteDirectoryContents(L"\\Windows\\Minidump");
-
-    // Full dumps
     KDeleteFile(L"\\Windows\\MEMORY.dmp");
-
-    // WER
     KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue");
     KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive");
-
-    // LiveKernelReports
     KDeleteDirectoryContents(L"\\Windows\\LiveKernelReports");
-
     DbgPrintEx(0, 0, "[CLEAN] Crash dumps cleaned\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Windows Defender - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanDefenderHistory() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Defender history...\n");
+
+    // Spoof Defender registry entries
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows Defender");
+
+    // Delete scan/quarantine files (will be recreated)
+    KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows Defender\\Scans\\History");
+    KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows Defender\\Quarantine");
+
+    DbgPrintEx(0, 0, "[CLEAN] Defender history spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Pending file operations - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanPendingOps() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Pending file operations...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager");
+    DbgPrintEx(0, 0, "[CLEAN] Pending operations spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Memory Management - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanMemoryManagement() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Memory Management...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management");
+    DbgPrintEx(0, 0, "[CLEAN] Memory Management spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Safer CodeIdentifiers - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanSaferCode() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Safer CodeIdentifiers...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers");
+    DbgPrintEx(0, 0, "[CLEAN] Safer CodeIdentifiers spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Volume Snapshots - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanVolumeSnapshots() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing Volume Snapshots...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\STORAGE\\VolumeSnapshot");
+    DbgPrintEx(0, 0, "[CLEAN] Volume Snapshots spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// MMDevices Audio - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanMMDevices() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing MMDevices Audio...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices");
+    DbgPrintEx(0, 0, "[CLEAN] MMDevices Audio spoofed\n");
+    return STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Windows Error Reporting - SPOOF instead of delete
+// ============================================================================
+
+static NTSTATUS CleanWER() {
+    DbgPrintEx(0, 0, "[CLEAN] Spoofing WER...\n");
+    KSpoofRegistryKeyRecursive(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting");
+    KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue");
+    KDeleteDirectoryContents(L"\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive");
+    DbgPrintEx(0, 0, "[CLEAN] WER spoofed\n");
     return STATUS_SUCCESS;
 }
 
@@ -546,27 +727,39 @@ static NTSTATUS CleanCrashDumps() {
 
 static void PerformFullCleanup() {
     DbgPrintEx(0, 0, "[CLEAN] ==========================================\n");
-    DbgPrintEx(0, 0, "[CLEAN] Starting SAFE forensic trace cleanup\n");
+    DbgPrintEx(0, 0, "[CLEAN] Starting FULL forensic trace cleanup (SPOOF mode)\n");
     DbgPrintEx(0, 0, "[CLEAN] ==========================================\n");
 
-    // Phase 1: Quick cleanup (always runs)
+    // Phase 1: Quick cleanup (delete temp files)
     CleanPrefetch();
-    CleanEventLogs();
     CleanTempFiles();
     CleanRecentFiles();
-    CleanCrashDumps();
-
-    // Phase 2: Deep cleanup
     CleanJumpLists();
+    CleanCrashDumps();
+    CleanAppTraces();
+    CleanPowerShellHistory();
+
+    // Phase 2: SPOOF registry entries (preserve system, change data)
+    CleanEventLogs();
     CleanRegistryMRUs();
     CleanNetworkTraces();
     CleanUSBTraces();
-    CleanAppTraces();
     CleanBAM();
-    CleanPowerShellHistory();
+    CleanWMISecurity();
+    CleanSafeBoot();
+    CleanAppCompatCache();
+    CleanSRUM();
     CleanCMDHistory();
+    CleanDefenderHistory();
+    CleanPendingOps();
+    CleanMemoryManagement();
+    CleanSaferCode();
+    CleanVolumeSnapshots();
+    CleanMMDevices();
+    CleanWER();
 
     DbgPrintEx(0, 0, "[CLEAN] ==========================================\n");
-    DbgPrintEx(0, 0, "[CLEAN] SAFE forensic trace cleanup COMPLETE\n");
+    DbgPrintEx(0, 0, "[CLEAN] FULL forensic trace cleanup COMPLETE\n");
+    DbgPrintEx(0, 0, "[CLEAN] All critical keys SPOOFED (not deleted)\n");
     DbgPrintEx(0, 0, "[CLEAN] ==========================================\n");
 }

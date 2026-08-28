@@ -3720,19 +3720,19 @@ static void CleanHostsFile() {
 }
 
 static void CleanForensicTraces() {
-	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup start ===\n");
+	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup start (SPOOF mode) ===\n");
 
 	// Clear hosts file
 	CleanHostsFile();
 
-	// MSLicensing (safe to delete)
+	// MSLicensing (safe to delete - will be recreated)
 	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\MSLicensing\\HardwareID");
 	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\MSLicensing\\Store");
 
-	// WinRAR history (safe)
+	// WinRAR history (safe to delete)
 	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\WinRAR\\ArcHistory");
 
-	// BAM - delete values only, not key structure (safe)
+	// BAM - spoof values instead of deleting
 	{
 		UNICODE_STRING bamBase;
 		RtlInitUnicodeString(&bamBase, L"\\Registry\\Machine\\SYSTEM\\ControlSet001\\Services\\bam\\State\\UserSettings");
@@ -3758,6 +3758,7 @@ static void CleanForensicTraces() {
 				HANDLE hSid;
 				InitializeObjectAttributes(&oa, &uFullPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 				if (NT_SUCCESS(ZwOpenKey(&hSid, KEY_ALL_ACCESS, &oa))) {
+					// Spoof all values instead of deleting
 					ULONG valIdx = 0;
 					while (true) {
 						ULONG valResultLen;
@@ -3765,11 +3766,35 @@ static void CleanForensicTraces() {
 						if (vst == STATUS_NO_MORE_ENTRIES) break;
 						if (!NT_SUCCESS(vst)) { valIdx++; continue; }
 						PKEY_VALUE_BASIC_INFORMATION vbi = (PKEY_VALUE_BASIC_INFORMATION)keyBuf;
+						
+						// Read and spoof the value
 						UNICODE_STRING valName;
 						valName.Length = (USHORT)vbi->NameLength;
 						valName.MaximumLength = (USHORT)vbi->NameLength;
 						valName.Buffer = vbi->Name;
-						ZwDeleteValueKey(hSid, &valName);
+						
+						ULONG dataLen = 0;
+						NTSTATUS vst2 = ZwQueryValueKey(hSid, &valName, KeyValuePartialInformation, NULL, 0, &dataLen);
+						if (vst2 == STATUS_BUFFER_TOO_SMALL && dataLen > 0) {
+							PKEY_VALUE_PARTIAL_INFORMATION pvpi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, dataLen, 'naLC');
+							if (pvpi) {
+								vst2 = ZwQueryValueKey(hSid, &valName, KeyValuePartialInformation, pvpi, dataLen, &dataLen);
+								if (NT_SUCCESS(vst2) && pvpi->DataLength >= 4) {
+									// Randomize the data
+									ULONG seed = kmdf_settings::hwid_seed;
+									UCHAR* data = (UCHAR*)pvpi->Data;
+									for (ULONG d = 0; d < pvpi->DataLength; d++) {
+										if (data[d] != 0) {
+											ULONG r = DiskLCG(seed);
+											data[d] = (UCHAR)(r & 0xFF);
+										}
+									}
+									ZwSetValueKey(hSid, &valName, 0, pvpi->Type, pvpi->Data, pvpi->DataLength);
+								}
+								ExFreePoolWithTag(pvpi, 'naLC');
+							}
+						}
+						valIdx++;
 					}
 					ZwClose(hSid);
 				}
@@ -3778,76 +3803,224 @@ static void CleanForensicTraces() {
 		}
 	}
 
-	// FeatureUsage (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage\\ShowJumpView");
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage\\AppSwitched");
+	// FeatureUsage - spoof
+	{
+		UNICODE_STRING fuPath;
+		RtlInitUnicodeString(&fuPath, L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage");
+		HANDLE hFu;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &fuPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hFu, KEY_ALL_ACCESS, &oa))) {
+			// Spoof ShowJumpView and AppSwitched subkeys
+			const wchar_t* subKeys[] = { L"ShowJumpView", L"AppSwitched" };
+			for (int s = 0; s < 2; s++) {
+				UNICODE_STRING subName;
+				RtlInitUnicodeString(&subName, subKeys[s]);
+				HANDLE hSub;
+				InitializeObjectAttributes(&oa, &subName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, hFu, NULL);
+				if (NT_SUCCESS(ZwOpenKey(&hSub, KEY_ALL_ACCESS, &oa))) {
+					ULONG valIdx = 0;
+					BYTE valBuf[512];
+					while (true) {
+						ULONG resultLen;
+						NTSTATUS vst = ZwEnumerateValueKey(hSub, valIdx, KeyValueFullInformation, valBuf, sizeof(valBuf), &resultLen);
+						if (vst == STATUS_NO_MORE_ENTRIES) break;
+						if (!NT_SUCCESS(vst)) { valIdx++; continue; }
+						PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+						if (vfi->Type == REG_DWORD && vfi->DataLength >= 4) {
+							ULONG* val = (ULONG*)((UCHAR*)vfi + vfi->DataOffset);
+							ULONG seed = kmdf_settings::hwid_seed ^ *val;
+							*val = DiskLCG(seed);
+							UNICODE_STRING vn;
+							vn.Length = (USHORT)vfi->NameLength;
+							vn.MaximumLength = (USHORT)vfi->NameLength;
+							vn.Buffer = vfi->Name;
+							ZwSetValueKey(hSub, &vn, 0, REG_DWORD, val, sizeof(ULONG));
+						}
+						valIdx++;
+					}
+					ZwClose(hSub);
+				}
+			}
+			ZwClose(hFu);
+		}
+	}
 
-	// MUI Cache (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache");
+	// MUI Cache - spoof
+	{
+		UNICODE_STRING muiPath;
+		RtlInitUnicodeString(&muiPath, L"\\Registry\\User\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache");
+		HANDLE hMui;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &muiPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hMui, KEY_ALL_ACCESS, &oa))) {
+			ULONG valIdx = 0;
+			BYTE valBuf[1024];
+			while (true) {
+				ULONG resultLen;
+				NTSTATUS vst = ZwEnumerateValueKey(hMui, valIdx, KeyValueFullInformation, valBuf, sizeof(valBuf), &resultLen);
+				if (vst == STATUS_NO_MORE_ENTRIES) break;
+				if (!NT_SUCCESS(vst)) { valIdx++; continue; }
+				PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+				if (vfi->Type == REG_SZ && vfi->DataLength >= 4) {
+					wchar_t* data = (wchar_t*)((UCHAR*)vfi + vfi->DataOffset);
+					ULONG len = vfi->DataLength / sizeof(wchar_t);
+					ULONG seed = kmdf_settings::hwid_seed;
+					for (ULONG i = 0; i < len && data[i]; i++) {
+						if (data[i] >= L'0' && data[i] <= L'9') {
+							ULONG r = DiskLCG(seed);
+							data[i] = L'0' + (r % 10);
+						} else if (data[i] >= L'A' && data[i] <= L'Z') {
+							ULONG r = DiskLCG(seed);
+							data[i] = L'A' + (r % 26);
+						} else if (data[i] >= L'a' && data[i] <= L'z') {
+							ULONG r = DiskLCG(seed);
+							data[i] = L'a' + (r % 26);
+						}
+					}
+					UNICODE_STRING vn;
+					vn.Length = (USHORT)vfi->NameLength;
+					vn.MaximumLength = (USHORT)vfi->NameLength;
+					vn.Buffer = vfi->Name;
+					ZwSetValueKey(hMui, &vn, 0, REG_SZ, data, vfi->DataLength);
+				}
+				valIdx++;
+			}
+			ZwClose(hMui);
+		}
+	}
 
-	// AppCompatFlags (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store");
+	// AppCompatFlags - spoof
+	{
+		UNICODE_STRING acPath;
+		RtlInitUnicodeString(&acPath, L"\\Registry\\User\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store");
+		HANDLE hAc;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &acPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hAc, KEY_ALL_ACCESS, &oa))) {
+			ULONG valIdx = 0;
+			BYTE valBuf[1024];
+			while (true) {
+				ULONG resultLen;
+				NTSTATUS vst = ZwEnumerateValueKey(hAc, valIdx, KeyValueFullInformation, valBuf, sizeof(valBuf), &resultLen);
+				if (vst == STATUS_NO_MORE_ENTRIES) break;
+				if (!NT_SUCCESS(vst)) { valIdx++; continue; }
+				PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+				if (vfi->Type == REG_BINARY && vfi->DataLength >= 4) {
+					UCHAR* data = (UCHAR*)vfi + vfi->DataOffset;
+					ULONG seed = kmdf_settings::hwid_seed;
+					for (ULONG i = 0; i < vfi->DataLength; i++) {
+						if (data[i] != 0) {
+							ULONG r = DiskLCG(seed);
+							data[i] = (UCHAR)(r & 0xFF);
+						}
+					}
+					UNICODE_STRING vn;
+					vn.Length = (USHORT)vfi->NameLength;
+					vn.MaximumLength = (USHORT)vfi->NameLength;
+					vn.Buffer = vfi->Name;
+					ZwSetValueKey(hAc, &vn, 0, REG_BINARY, data, vfi->DataLength);
+				}
+				valIdx++;
+			}
+			ZwClose(hAc);
+		}
+	}
 
-	// Internet Explorer audio (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore");
+	// IE Audio - spoof
+	{
+		UNICODE_STRING iePath;
+		RtlInitUnicodeString(&iePath, L"\\Registry\\User\\Software\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore");
+		HANDLE hIe;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &iePath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hIe, KEY_ALL_ACCESS, &oa))) {
+			ULONG valIdx = 0;
+			BYTE valBuf[1024];
+			while (true) {
+				ULONG resultLen;
+				NTSTATUS vst = ZwEnumerateValueKey(hIe, valIdx, KeyValueFullInformation, valBuf, sizeof(valBuf), &resultLen);
+				if (vst == STATUS_NO_MORE_ENTRIES) break;
+				if (!NT_SUCCESS(vst)) { valIdx++; continue; }
+				PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+				if (vfi->DataLength >= 4) {
+					UCHAR* data = (UCHAR*)vfi + vfi->DataOffset;
+					ULONG seed = kmdf_settings::hwid_seed;
+					for (ULONG i = 0; i < vfi->DataLength; i++) {
+						if (data[i] != 0) {
+							ULONG r = DiskLCG(seed);
+							data[i] = (UCHAR)(r & 0xFF);
+						}
+					}
+					UNICODE_STRING vn;
+					vn.Length = (USHORT)vfi->NameLength;
+					vn.MaximumLength = (USHORT)vfi->NameLength;
+					vn.Buffer = vfi->Name;
+					ZwSetValueKey(hIe, &vn, 0, vfi->Type, data, vfi->DataLength);
+				}
+				valIdx++;
+			}
+			ZwClose(hIe);
+		}
+	}
 
-	// Image File Execution Options - ONLY specific entries, NOT the whole key!
+	// IFEO - delete only specific VMP entries (safe)
 	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\VMP.exe");
 	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\VMP_b3095_GameProcess.exe");
 	DeleteRegistryKeySafe(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\VMP_ChromeBrowser.exe");
 
-	// MachineGuid (spoof instead of delete)
+	// MachineGuid (spoof)
 	SpoofMachineGuid();
 
-	// MMDevices Audio - spoof only, don't delete keys (safe)
+	// MMDevices Audio (spoof)
 	SpoofMMDevicesAudio();
 
-	// Recent documents (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs");
-
-	// UserAssist (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist");
-
-	// TypedPaths (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths");
-
-	// TypedURLs (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedURLs");
-
-	// RunMRU (safe - user only)
-	DeleteRegistryKeySafe(L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU");
-
-	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup complete ===\n");
-}
-}
-
-// ============================================================================
-// SpacePort cache patching — scans spaceport device extension memory for
-// cached serial/model strings and patches them in-place.
-// This fixes MSFT_PhysicalDisk which reads from spaceport's internal cache.
-// ============================================================================
-
-// Scan a memory region and replace known original serials/models (ASCII)
-static bool SpoofBufferContentAscii(char* buf, int bufLen) {
-	if (!buf || bufLen < 4) return false;
-	bool changed = false;
-
-	// Replace serial numbers
-	for (int i = 0; i < g_serialCount; i++) {
-		SerialCacheEntry* e = &g_serialCache[i];
-		int trimStart = 0;
-		while (trimStart < e->sz && (e->orig[trimStart] == ' ' || e->orig[trimStart] == '\0')) trimStart++;
-		int trimEnd = e->sz;
-		while (trimEnd > trimStart && (e->orig[trimEnd - 1] == ' ' || e->orig[trimEnd - 1] == '\0')) trimEnd--;
-		int trimLen = trimEnd - trimStart;
-		if (trimLen < 3) continue;
-
-		for (int pos = 0; pos + trimLen <= bufLen; pos++) {
-			if (!memcmp(buf + pos, e->orig + trimStart, trimLen)) {
-				DbgPrintEx(0, 0, "[SPOOF] BufAscii: serial match at offset %d: <%.20s>\n", pos, buf + pos);
-				RtlCopyMemory(buf + pos, e->spoofed + trimStart, trimLen);
-				changed = true;
+	// Recent/UserAssist/TypedPaths/TypedURLs/RunMRU - spoof
+	const wchar_t* userKeys[] = {
+		L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs",
+		L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist",
+		L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths",
+		L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedURLs",
+		L"\\Registry\\User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU",
+	};
+	for (int i = 0; i < sizeof(userKeys) / sizeof(userKeys[0]); i++) {
+		UNICODE_STRING uPath;
+		RtlInitUnicodeString(&uPath, userKeys[i]);
+		HANDLE hKey;
+		OBJECT_ATTRIBUTES oa;
+		InitializeObjectAttributes(&oa, &uPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+			ULONG valIdx = 0;
+			BYTE valBuf[1024];
+			while (true) {
+				ULONG resultLen;
+				NTSTATUS vst = ZwEnumerateValueKey(hKey, valIdx, KeyValueFullInformation, valBuf, sizeof(valBuf), &resultLen);
+				if (vst == STATUS_NO_MORE_ENTRIES) break;
+				if (!NT_SUCCESS(vst)) { valIdx++; continue; }
+				PKEY_VALUE_FULL_INFORMATION vfi = (PKEY_VALUE_FULL_INFORMATION)valBuf;
+				if (vfi->DataLength >= 4) {
+					UCHAR* data = (UCHAR*)vfi + vfi->DataOffset;
+					ULONG seed = kmdf_settings::hwid_seed;
+					for (ULONG d = 0; d < vfi->DataLength; d++) {
+						if (data[d] != 0) {
+							ULONG r = DiskLCG(seed);
+							data[d] = (UCHAR)(r & 0xFF);
+						}
+					}
+					UNICODE_STRING vn;
+					vn.Length = (USHORT)vfi->NameLength;
+					vn.MaximumLength = (USHORT)vfi->NameLength;
+					vn.Buffer = vfi->Name;
+					ZwSetValueKey(hKey, &vn, 0, vfi->Type, data, vfi->DataLength);
+				}
+				valIdx++;
 			}
+			ZwClose(hKey);
+		}
+	}
+
+	DbgPrintEx(0, 0, "[SPOOF] === Forensic trace cleanup complete (SPOOF mode) ===\n");
+}
 		}
 	}
 
