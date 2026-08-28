@@ -10,6 +10,7 @@
 #include "../../backend/spoofing/smbios/base_board.h"
 #include "../../backend/spoofing/gpu/gpu.h"
 #include "../../backend/spoofing/efi/efispoof.h"
+#include "../../backend/spoofing/cleanup/cleanup.h"
 
 UNICODE_STRING link;
 

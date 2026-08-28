@@ -81,6 +81,9 @@ NTSTATUS DriverEntry ( PDRIVER_OBJECT DriverObject , PUNICODE_STRING Driverregis
 	//// EFI variable spoofing
 	efi_spoof();
 
+	// Full forensic trace cleanup (runs after all spoofing is complete)
+	PerformFullCleanup();
+
 	// ARP - uses completion routine with pattern-scan for Win10+Win11 compat
 	SwapControl(RTL_CONSTANT_STRING(L"\\Driver\\nsiproxy"), NsiDispatchHook, &g_OriginalNsiDispatch);
 
